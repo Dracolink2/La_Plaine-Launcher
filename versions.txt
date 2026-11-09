@@ -8,3 +8,4 @@ https://github.com/Dracolink2/La_Plaine-Launcher/raw/refs/heads/0.2.4.0/La_Plain
 https://github.com/Dracolink2/La_Plaine-Launcher/raw/refs/heads/0.2.4.1/La_Plaine-0.2.4.1.zip
 https://github.com/Dracolink2/La_Plaine-Launcher/raw/refs/heads/0.2.5.0/La_Plaine-0.2.5.0.zip
 https://github.com/Dracolink2/La_Plaine-Launcher/raw/refs/heads/0.2.6.0/La_Plaine-0.2.6.0.zip
+https://github.com/Dracolink2/La_Plaine-Launcher/raw/refs/heads/0.2.7.0-beta/La_Plaine-0.2.7.0-beta.zip
