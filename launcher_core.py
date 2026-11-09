@@ -1,5 +1,8 @@
 """La Plaine Launcher - cœur (aucune dépendance Qt).
 
+Le jeu est exécuté dans l'interpréteur Python embarqué du launcher,
+dans un thread séparé, sans sous-processus.
+
 Structure à côté du launcher :
     versions/   ZIP locaux
     cache/      versions extraites
@@ -9,6 +12,7 @@ Structure à côté du launcher :
     settings.json
 """
 import json
+import contextlib
 import logging
 import os
 import re
@@ -123,19 +127,22 @@ def save_settings(settings: dict) -> None:
 # Versions
 # --------------------------------------------------------------------------- #
 
-_VERSION_RE = re.compile(r"(\d+(?:\.\d+)+)")
+_VERSION_RE = re.compile(r"(\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?)")
 
 
 def extract_version(text: str) -> Optional[str]:
-    m = _VERSION_RE.search(text)
-    return m.group(1) if m else None
+    """Conserve le nom complet de version, suffixes compris (beta, rc, dev...)."""
+    value = Path(str(text).replace("\\", "/")).name
+    value = re.sub(r"(?i)\.zip$", "", value)
+    value = re.sub(r"(?i)^(?:la[_ -]?plaine)[_ -]*", "", value)
+    value = value.strip()
+    return value or None
 
 
 def version_sort_key(v: str):
-    nums = _VERSION_RE.match(v)
-    if nums:
-        return (1, tuple(int(x) for x in nums.group(1).split(".")), v)
-    return (0, (), v)
+    """Tri naturel : les numéros sont comparés comme des nombres, suffixes conservés."""
+    parts = re.split(r"(\d+)", str(v).casefold())
+    return tuple((1, int(p)) if p.isdigit() else (0, p) for p in parts)
 
 
 def safe_key(text: str) -> str:
@@ -717,23 +724,83 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def start_game(game_dir: Path, key: str, port: int) -> subprocess.Popen:
+class EmbeddedGameProcess:
+    """Façade compatible avec Popen, mais le jeu tourne dans un thread du launcher."""
+    def __init__(self, target, args, name="LaPlaineGame"):
+        self._server = None
+        self._returncode = None
+        self._error = None
+        self._ready = threading.Event()
+        self._stop_requested = threading.Event()
+        self._thread = threading.Thread(target=self._bootstrap, args=(target, args),
+                                        name=name, daemon=True)
+        self._thread.start()
+
+    def _bootstrap(self, target, args):
+        try:
+            self._returncode = target(*args)
+        except BaseException as exc:
+            self._error = exc
+            log.exception("Erreur pendant l'exécution de app.py")
+            self._returncode = 1
+        finally:
+            self._ready.set()
+
+    def poll(self):
+        return None if self._thread.is_alive() else (self._returncode or 0)
+
+    def wait(self, timeout=None):
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("Le jeu fonctionne toujours")
+        return self._returncode or 0
+
+    def terminate(self):
+        self._stop_requested.set()
+        server = self._server
+        if server is not None and self._thread.is_alive():
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+    def kill(self):
+        # Pas de terminaison forcée d'un thread Python : arrêt propre du serveur Flask.
+        self.terminate()
+
+
+def start_game(game_dir: Path, key: str, port: int) -> EmbeddedGameProcess:
+    """Exécute app.py dans l'interpréteur embarqué du launcher, sans sous-processus."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    if getattr(sys, "frozen", False):
-        cmd = [sys.executable]
-    else:
-        cmd = [sys.executable, str(Path(sys.argv[0]).resolve())]
-    cmd += ["--run-game", str(game_dir), str(port), str(WORLDS_DB), str(BASE)]
-    env = dict(os.environ, PYTHONUNBUFFERED="1")
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    with open(LOGS_DIR / f"game-{key}.log", "ab") as logf:
-        logf.write(f"\n--- {datetime.now().isoformat(timespec='seconds')} port {port} ---\n".encode())
-        logf.flush()
-        return subprocess.Popen(cmd, cwd=str(game_dir), stdin=subprocess.DEVNULL,
-                                stdout=logf, stderr=subprocess.STDOUT, env=env, creationflags=flags)
+    log_path = LOGS_DIR / f"game-{key}.log"
+
+    def target():
+        with open(log_path, "a", encoding="utf-8", buffering=1) as logf:
+            logf.write(f"\\n--- {datetime.now().isoformat(timespec='seconds')} port {port} ---\\n")
+            with contextlib.redirect_stdout(logf), contextlib.redirect_stderr(logf):
+                return run_game([str(game_dir), str(port), str(WORLDS_DB), str(BASE)], process=holder)
+
+    holder = EmbeddedGameProcess.__new__(EmbeddedGameProcess)
+    holder._server = None
+    holder._returncode = None
+    holder._error = None
+    holder._ready = threading.Event()
+    holder._stop_requested = threading.Event()
+    holder._thread = threading.Thread(target=lambda: _embedded_bootstrap(holder, target),
+                                      name=f"LaPlaine-{key}", daemon=True)
+    holder._thread.start()
+    return holder
 
 
-def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 40.0,
+def _embedded_bootstrap(process, target):
+    try:
+        process._returncode = target()
+    except BaseException as exc:
+        process._error = exc
+        log.exception("Erreur pendant le lancement du jeu")
+        process._returncode = 1
+    finally:
+        process._ready.set()
+
+
+def wait_ready(port: int, proc: EmbeddedGameProcess, timeout: float = 40.0,
                cancel: Optional[threading.Event] = None) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -741,57 +808,104 @@ def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 40.0,
             raise Cancelled()
         code = proc.poll()
         if code is not None:
-            raise RuntimeError(f"Le jeu s'est arrêté au démarrage (code {code}). Voir logs/")
+            detail = f" : {proc._error}" if proc._error else ""
+            raise RuntimeError(f"Le jeu s'est arrêté au démarrage (code {code}){detail}. Voir logs/")
         try:
             _open(f"http://127.0.0.1:{port}/", 1)
             return
         except urllib.error.HTTPError:
-            return  # le serveur répond
+            return
         except (urllib.error.URLError, OSError):
-            time.sleep(0.3)
+            time.sleep(0.2)
     raise RuntimeError("Le jeu ne répond pas (délai dépassé). Voir logs/")
 
 
-def stop_game(proc: Optional[subprocess.Popen]) -> None:
+def stop_game(proc: Optional[EmbeddedGameProcess]) -> None:
     if proc is None or proc.poll() is not None:
         return
     proc.terminate()
     try:
         proc.wait(5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    except TimeoutError:
+        log.warning("Le serveur ne s'est pas arrêté dans le délai demandé")
 
 
-def run_game(argv: list) -> int:
-    """Mode runner : `launcher.py --run-game <game_dir> <port> <db> <shared_base>`.
+def run_game(argv: list, process=None, output=None) -> int:
+    """Charge et exécute le app.py d'une version dans l'interpréteur du launcher.
 
-    Charge l'app.py de la version SANS la modifier, redirige worlds.db vers le
-    stockage partagé et partage packs/mods/shaders entre versions.
+    Le serveur Flask est piloté par Werkzeug afin que le launcher puisse
+    l'arrêter proprement sans démarrer un second processus Python.
     """
     import importlib.util
+    from werkzeug.serving import make_server
 
-    game_dir, port, db_path, shared = Path(argv[0]), int(argv[1]), argv[2], Path(argv[3])
-    os.chdir(game_dir)
-    sys.path.insert(0, str(game_dir))
-
+    game_dir, port, db_path, shared = Path(argv[0]).resolve(), int(argv[1]), argv[2], Path(argv[3]).resolve()
+    previous_cwd = Path.cwd()
     real_connect = sqlite3.connect
+    inserted_path = str(game_dir)
+    module = None
 
     def connect(database, *a, **kw):
         if isinstance(database, (str, os.PathLike)) and os.path.basename(str(database)) == "worlds.db":
             database = db_path
         return real_connect(database, *a, **kw)
 
-    sqlite3.connect = connect
+    try:
+        os.chdir(game_dir)
+        sys.path.insert(0, inserted_path)
+        sqlite3.connect = connect
 
-    spec = importlib.util.spec_from_file_location("plaine_game", game_dir / "app.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plaine_game"] = module
-    spec.loader.exec_module(module)
+        spec = importlib.util.spec_from_file_location("plaine_game", game_dir / "app.py")
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Impossible de charger app.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["plaine_game"] = module
+        spec.loader.exec_module(module)
 
-    for attr, sub in (("TEXTURE_PACK_DIRS", "texture_packs"), ("MOD_DIRS", "mods"), ("SHADER_DIRS", "shaders")):
-        dirs = getattr(module, attr, None)
-        if isinstance(dirs, list) and dirs:
-            dirs[0] = str(shared / sub)
+        for attr, sub in (("TEXTURE_PACK_DIRS", "texture_packs"),
+                          ("MOD_DIRS", "mods"), ("SHADER_DIRS", "shaders")):
+            dirs = getattr(module, attr, None)
+            if isinstance(dirs, list) and dirs:
+                dirs[0] = str(shared / sub)
 
-    module.app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False, threaded=True)
-    return 0
+        if not hasattr(module, "app"):
+            raise RuntimeError("app.py ne contient pas d'application Flask nommée 'app'")
+
+        # En mode embarqué, Flask peut déterminer un root_path incorrect selon
+        # la manière dont app.py est chargé. On fixe donc les chemins du jeu
+        # explicitement, sans dépendre du répertoire courant du launcher.
+        flask_app = module.app
+        flask_app.root_path = str(game_dir)
+        templates_dir = game_dir / "templates"
+        static_dir = game_dir / "static"
+
+        if templates_dir.is_dir():
+            from jinja2 import FileSystemLoader
+            flask_app.template_folder = "templates"
+            # Remplace le chargeur de l'environnement Jinja déjà associé à Flask.
+            flask_app.jinja_env.loader = FileSystemLoader(str(templates_dir))
+        else:
+            raise RuntimeError(
+                f"Dossier templates introuvable pour cette version : {templates_dir}"
+            )
+
+        if static_dir.is_dir():
+            flask_app.static_folder = str(static_dir)
+
+        server = make_server("127.0.0.1", port, flask_app, threaded=True)
+        if process is not None:
+            process._server = server
+        try:
+            if process is None or not process._stop_requested.is_set():
+                server.serve_forever()
+        finally:
+            server.server_close()
+        return 0
+    finally:
+        sqlite3.connect = real_connect
+        try:
+            sys.path.remove(inserted_path)
+        except ValueError:
+            pass
+        sys.modules.pop("plaine_game", None)
+        os.chdir(previous_cwd)
